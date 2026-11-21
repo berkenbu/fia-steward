@@ -12,12 +12,23 @@ from collections import deque
 
 from panda3d.core import (loadPrcFileData, Vec3, Point3, Point2, TextNode, CardMaker, LineSegs,
     AmbientLight, DirectionalLight, Fog, TransparencyAttrib, GeomVertexFormat,
-    GeomVertexData, GeomVertexWriter, Geom, GeomTriangles, GeomNode, AntialiasAttrib)
+    GeomVertexData, GeomVertexWriter, Geom, GeomTriangles, GeomNode, AntialiasAttrib,
+    PNMImage, Texture, SamplerState, GeomVertexArrayFormat)
 loadPrcFileData("", "window-title FIA Steward Simulator\nwin-size 1600 900\n"
                     "sync-video 1\nmultisamples 4\nframebuffer-multisample 1\n")
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.OnscreenText import OnscreenText
 from panda3d.bullet import BulletWorld, BulletRigidBodyNode, BulletBoxShape
+try:                                    # optional visual upgrades: pip install panda3d-simplepbr panda3d-gltf
+    import simplepbr
+except ImportError:
+    simplepbr = None
+try:
+    import gltf
+except ImportError:
+    gltf = None
+HERE = os.path.dirname(os.path.abspath(__file__))
+QUALITY = os.environ.get("FIA_QUALITY", "high").lower()     # high | low (low = no PBR/bloom)
 
 # ------------------------------------------------------------------ constants
 LAPS = 6
@@ -84,11 +95,26 @@ class Mesh:
              ((0, 0, 1), [(-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)]),
              ((0, 0, -1), [(-1, -1, -1), (-1, 1, -1), (1, 1, -1), (1, -1, -1)])]
 
+    _fmt = None
+
+    @staticmethod
+    def fmt():
+        if Mesh._fmt is None:
+            a = GeomVertexArrayFormat()
+            a.addColumn("vertex", 3, Geom.NTFloat32, Geom.CPoint)
+            a.addColumn("normal", 3, Geom.NTFloat32, Geom.CNormal)
+            a.addColumn("texcoord", 2, Geom.NTFloat32, Geom.CTexcoord)
+            a.addColumn("color", 4, Geom.NTUint8, Geom.CColor)
+            f = GeomVertexFormat(); f.addArray(a)
+            Mesh._fmt = GeomVertexFormat.registerFormat(f)
+        return Mesh._fmt
+
     def __init__(s):
-        s.vd = GeomVertexData("m", GeomVertexFormat.getV3n3c4(), Geom.UHStatic)
+        s.vd = GeomVertexData("m", Mesh.fmt(), Geom.UHStatic)
         s.vw = GeomVertexWriter(s.vd, "vertex")
         s.nw = GeomVertexWriter(s.vd, "normal")
         s.cw = GeomVertexWriter(s.vd, "color")
+        s.tw = GeomVertexWriter(s.vd, "texcoord")
         s.prim = GeomTriangles(Geom.UHStatic)
         s.n = 0
 
@@ -104,6 +130,9 @@ class Mesh:
             nx, ny, nz = -nx, -ny, -nz
         for p in (a, b, c):
             s.vw.addData3(p[0], p[1], p[2]); s.nw.addData3(nx, ny, nz)
+            # world-planar UVs (6 m tiles): floors use x/y, walls use along-wall/z
+            if abs(nz) > 0.5: s.tw.addData2(p[0] / 6.0, p[1] / 6.0)
+            else: s.tw.addData2((p[0] + p[1]) / 6.0, p[2] / 6.0)
             s.cw.addData4(col[0], col[1], col[2], col[3] if len(col) > 3 else 1.0)
         s.prim.addVertices(s.n, s.n + 1, s.n + 2)
         s.n += 3
@@ -142,6 +171,18 @@ class Mesh:
 def build_car(parent, col, helmet, num):
     """Low-poly F1 car: monocoque, nose, sidepods, wings, halo, 4 wheels, DRS flap."""
     root = parent.attachNewNode("car")
+    mp = os.path.join(HERE, "models", "car.glb")
+    if gltf is not None and os.path.exists(mp):
+        # optional: drop a glTF car at models/car.glb; a node named "flap" is animated for DRS,
+        # nodes named "body*" are tinted with the team colour.
+        model = loader.loadModel(mp); model.reparentTo(root)
+        for n in model.findAllMatches("**/body*"): n.setColorScale(col[0], col[1], col[2], 1)
+        flap = model.find("**/flap")
+        if flap.isEmpty(): flap = root.attachNewNode("flap")
+        tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
+        tn.setTextColor(1, 1, 1, 1); tn.setShadow(0.06, 0.06); tn.setShadowColor(0, 0, 0, 1)
+        t = root.attachNewNode(tn); t.setBillboardPointEye(); t.setScale(2.2); t.setPos(0, 0, 3.0); t.setLightOff()
+        return root, flap
     c = (col[0], col[1], col[2], 1); c2 = (col[0] * .6, col[1] * .6, col[2] * .6, 1)
     dk = (0.07, 0.07, 0.08, 1)
     m = Mesh()
@@ -520,7 +561,7 @@ class Game(ShowBase):
         except Exception: s.mono = None
         s.track = Track()
         s.world = BulletWorld(); s.world.setGravity(Vec3(0, 0, 0))
-        s.setup_lights(); s.build_scene()
+        s.setup_lights(); s.build_scene(); s.build_sky()
         s.cars, s.dots = [], []
         s.laps_opt, s.laps_i = [3, 4, 6, 8, 10], 2
         s.levels, s.lvl_i = list(LEVELS.keys()), 0
@@ -981,7 +1022,7 @@ class Game(ShowBase):
         if s.state == "menu":
             s.menu_a += dt * 0.07; a = s.menu_a
             cam.setPos(-45 + 260 * math.cos(a), -10 + 260 * math.sin(a), 70 + 20 * math.sin(a * 2.3))
-            cam.lookAt(-45, -10, 4); s.camLens.setFov(62)
+            cam.lookAt(-45, -10, 4); s.camLens.setFov(62); s.sky.setPos(cam.getPos())
             s.sun_np.setPos(35, -70, 150); s.sun_np.lookAt(-45, -10, 0)
             return
         car = s.cars[s.follow]
@@ -1012,6 +1053,7 @@ class Game(ShowBase):
         else:
             cam.setPos(pos + fwd * 0.4 + Vec3(0, 0, 1.15)); cam.setHpr(car.vis.getH(s.render), -1.5, 0); fov = 88
         s.camLens.setFov(fov)
+        s.sky.setPos(cam.getPos())
         s.sun_np.setPos(pos + Vec3(80, -60, 150)); s.sun_np.lookAt(pos[0], pos[1], pos[2])
 
     def update_ui(s, dt):
@@ -1084,12 +1126,16 @@ class Game(ShowBase):
         amb = AmbientLight("a"); amb.setColor((0.50, 0.53, 0.60, 1))
         s.render.setLight(s.render.attachNewNode(amb))
         sun = DirectionalLight("sun"); sun.setColor((1.0, 0.95, 0.85, 1))
-        sun.setShadowCaster(True, 2048, 2048)
+        sun.setShadowCaster(True, 4096 if QUALITY == "high" else 2048, 4096 if QUALITY == "high" else 2048)
         ln = sun.getLens(); ln.setFilmSize(240, 240); ln.setNearFar(20, 520)
         s.sun_np = s.render.attachNewNode(sun)
         s.sun_np.setPos(100, -80, 200); s.sun_np.lookAt(0, 0, 0)
         s.render.setLight(s.sun_np)
-        s.render.setShaderAuto()
+        if simplepbr is not None and QUALITY == "high":
+            s.pbr = simplepbr.init(msaa_samples=4, max_lights=2, use_normal_maps=False,
+                                   enable_shadows=True, exposure=1.0)
+        else:
+            s.render.setShaderAuto()
         fog = Fog("fog"); fog.setColor(0.55, 0.72, 0.93); fog.setExpDensity(0.0007)
         s.render.setFog(fog)
 
@@ -1164,7 +1210,42 @@ class Game(ShowBase):
             m.frustum((x, y), 2.2, 11, 3.4, 0.1, (0.08, gch * 0.6, 0.1, 1), 8)
             placed += 1
         random.seed()
-        m.build(s.render, "world")
+        w = m.build(s.render, "world")
+        w.setTexture(s.make_grain(0.82, 0.34, 0.45, 3))
+
+    def make_grain(s, base, var, blotch, seed):
+        """Mean-grey tileable noise texture, modulated with vertex colours (tarmac/grass/kerb grain)."""
+        rnd = random.Random(seed); n = 256
+        img = PNMImage(n, n, 3)
+        low = [[rnd.random() for _ in range(16)] for _ in range(16)]
+        for y in range(n):
+            for x in range(n):
+                fx, fy = x / 16.0, y / 16.0; ix, iy = int(fx), int(fy); tx, ty = fx - ix, fy - iy
+                a, b = low[iy][ix], low[iy][(ix + 1) % 16]; c, d = low[(iy + 1) % 16][ix], low[(iy + 1) % 16][(ix + 1) % 16]
+                lo = (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+                v = clamp(base + (rnd.random() - 0.5) * var + (lo - 0.5) * blotch, 0, 1)
+                img.setXel(x, y, v, v, v)
+        tex = Texture("grain"); tex.load(img)
+        tex.setWrapU(SamplerState.WM_repeat); tex.setWrapV(SamplerState.WM_repeat)
+        tex.setMinfilter(SamplerState.FT_linear_mipmap_linear); tex.setAnisotropicDegree(8)
+        return tex
+
+    def build_sky(s):
+        """Gradient sky dome that follows the camera (no lighting, no depth write)."""
+        m = Mesh(); R = 3500.0; rings, segs = 8, 24
+        def col(el):
+            t = clamp(el / (math.pi / 2), 0, 1)
+            return (0.78 + (0.20 - 0.78) * t, 0.86 + (0.45 - 0.86) * t, 0.95 + (0.85 - 0.95) * t, 1)
+        def pt(el, az): return (R * math.cos(el) * math.cos(az), R * math.cos(el) * math.sin(az), R * math.sin(el))
+        for r in range(rings):
+            e0, e1 = -0.1 + (math.pi / 2 + 0.1) * r / rings, -0.1 + (math.pi / 2 + 0.1) * (r + 1) / rings
+            for k in range(segs):
+                a0, a1 = 2 * math.pi * k / segs, 2 * math.pi * (k + 1) / segs
+                P = [pt(e0, a0), pt(e0, a1), pt(e1, a1), pt(e1, a0)]; C = [col(e0), col(e0), col(e1), col(e1)]
+                m.tri(P[0], P[1], P[2], C[0], (0, 0, -1)); m.tri(P[0], P[2], P[3], C[2], (0, 0, -1))
+        s.sky = m.build(s.render, "sky")
+        s.sky.setLightOff(); s.sky.setShaderOff(); s.sky.setFogOff(); s.sky.setTwoSided(True)
+        s.sky.setBin("background", 0); s.sky.setDepthWrite(False); s.sky.setDepthTest(False)
 
     def rect(s, parent, x0, z0, x1, z1, col):
         cm = CardMaker("r"); cm.setFrame(x0, x1, z0, z1)
