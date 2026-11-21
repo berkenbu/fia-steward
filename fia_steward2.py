@@ -13,7 +13,7 @@ from collections import deque
 from panda3d.core import (loadPrcFileData, Vec3, Point3, Point2, TextNode, CardMaker, LineSegs,
     AmbientLight, DirectionalLight, Fog, TransparencyAttrib, GeomVertexFormat,
     GeomVertexData, GeomVertexWriter, Geom, GeomTriangles, GeomNode, AntialiasAttrib,
-    PNMImage, Texture, SamplerState, GeomVertexArrayFormat)
+    PNMImage, Texture, SamplerState, GeomVertexArrayFormat, NodePath)
 loadPrcFileData("", "window-title FIA Steward Simulator\nwin-size 1600 900\n"
                     "sync-video 1\nmultisamples 4\nframebuffer-multisample 1\n")
 from direct.showbase.ShowBase import ShowBase
@@ -168,15 +168,43 @@ class Mesh:
         return parent.attachNewNode(gn)
 
 
+_TEAM_TEX = {}
+
+
+def tint_car(model, col):
+    """Recolour the red-dominant pixels of the car's livery texture to the team colour (needs numpy)."""
+    try:
+        import numpy as np
+        key = tuple(round(c, 2) for c in col)
+        if key not in _TEAM_TEX:
+            tex = model.findAllTextures()[0]
+            w, h = tex.getXSize(), tex.getYSize()
+            a = np.frombuffer(bytes(tex.getRamImageAs("RGB")), dtype=np.uint8).reshape(h, w, 3).astype(np.float32) / 255.0
+            r, g, b = a[..., 0], a[..., 1], a[..., 2]
+            red = (r > 0.25) & (r > g * 1.6) & (r > b * 1.6)
+            k = np.clip(r / 0.8, 0, 1.2)[..., None] * np.array(col[:3], dtype=np.float32)
+            out = np.where(red[..., None], k, a)
+            nt = Texture("team"); nt.setup2dTexture(w, h, Texture.T_unsigned_byte, Texture.F_rgb)
+            nt.setRamImageAs((np.clip(out, 0, 1) * 255).astype(np.uint8).tobytes(), "RGB")
+            nt.setMinfilter(SamplerState.FT_linear_mipmap_linear); nt.setAnisotropicDegree(8)
+            _TEAM_TEX[key] = nt
+        model.setTexture(model.findAllTextureStages()[0], _TEAM_TEX[key], 10)
+    except Exception as e:
+        print("team tint skipped:", e)
+
+
 def build_car(parent, col, helmet, num):
     """Low-poly F1 car: monocoque, nose, sidepods, wings, halo, 4 wheels, DRS flap."""
     root = parent.attachNewNode("car")
     mp = os.path.join(HERE, "models", "car.glb")
     if gltf is not None and os.path.exists(mp):
-        # optional: drop a glTF car at models/car.glb; a node named "flap" is animated for DRS,
-        # nodes named "body*" are tinted with the team colour.
-        model = loader.loadModel(mp); model.reparentTo(root)
-        for n in model.findAllMatches("**/body*"): n.setColorScale(col[0], col[1], col[2], 1)
+        # glTF car at models/car.glb (nose toward -Y in the shipped f2002, so it is turned 180 deg).
+        # The red livery is recoloured per team; an optional node named "flap" is animated for DRS.
+        model = NodePath(gltf.load_model(mp)); model.setScale(0.95); model.setH(180)
+        mn, mx = model.getTightBounds()
+        model.setPos(-(mn.x + mx.x) / 2, -(mn.y + mx.y) / 2 + 0.1, -mn.z)
+        model.reparentTo(root)
+        tint_car(model, col)
         flap = model.find("**/flap")
         if flap.isEmpty(): flap = root.attachNewNode("flap")
         tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
