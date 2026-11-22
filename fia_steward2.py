@@ -13,7 +13,7 @@ from collections import deque
 from panda3d.core import (loadPrcFileData, Vec3, Point3, Point2, TextNode, CardMaker, LineSegs,
     AmbientLight, DirectionalLight, Fog, TransparencyAttrib, GeomVertexFormat,
     GeomVertexData, GeomVertexWriter, Geom, GeomTriangles, GeomNode, AntialiasAttrib,
-    PNMImage, Texture, SamplerState, GeomVertexArrayFormat, NodePath)
+    PNMImage, Texture, SamplerState, GeomVertexArrayFormat, NodePath, BitMask32)
 loadPrcFileData("", "window-title FIA Steward Simulator\nwin-size 1600 900\n"
                     "sync-video 1\nmultisamples 4\nframebuffer-multisample 1\n")
 from direct.showbase.ShowBase import ShowBase
@@ -27,6 +27,7 @@ try:
     import gltf
 except ImportError:
     gltf = None
+NO_SHADOW = BitMask32.bit(5)           # the sun's shadow camera only renders things not hidden from this bit
 HERE = os.path.dirname(os.path.abspath(__file__))
 QUALITY = os.environ.get("FIA_QUALITY", "high").lower()     # high | low (low = no PBR/bloom)
 
@@ -105,16 +106,19 @@ class Mesh:
             a.addColumn("normal", 3, Geom.NTFloat32, Geom.CNormal)
             a.addColumn("texcoord", 2, Geom.NTFloat32, Geom.CTexcoord)
             a.addColumn("color", 4, Geom.NTUint8, Geom.CColor)
+            a.addColumn("tangent", 4, Geom.NTFloat32, Geom.CVector)   # simplepbr builds its TBN basis from this; zero = NaN lighting
             f = GeomVertexFormat(); f.addArray(a)
             Mesh._fmt = GeomVertexFormat.registerFormat(f)
         return Mesh._fmt
 
-    def __init__(s):
+    def __init__(s, uv=6.0):
+        s.uv = uv                                   # metres per texture tile
         s.vd = GeomVertexData("m", Mesh.fmt(), Geom.UHStatic)
         s.vw = GeomVertexWriter(s.vd, "vertex")
         s.nw = GeomVertexWriter(s.vd, "normal")
         s.cw = GeomVertexWriter(s.vd, "color")
         s.tw = GeomVertexWriter(s.vd, "texcoord")
+        s.gw = GeomVertexWriter(s.vd, "tangent")
         s.prim = GeomTriangles(Geom.UHStatic)
         s.n = 0
 
@@ -128,11 +132,14 @@ class Mesh:
         if nrm and nx * nrm[0] + ny * nrm[1] + nz * nrm[2] < 0:
             b, c = c, b
             nx, ny, nz = -nx, -ny, -nz
+        if abs(nz) > 0.5: tx, ty = 1.0, 0.0                       # tangent = texture U direction
+        else:
+            tl = math.hypot(nx, ny) or 1.0; tx, ty = -ny / tl, nx / tl
         for p in (a, b, c):
-            s.vw.addData3(p[0], p[1], p[2]); s.nw.addData3(nx, ny, nz)
-            # world-planar UVs (6 m tiles): floors use x/y, walls use along-wall/z
-            if abs(nz) > 0.5: s.tw.addData2(p[0] / 6.0, p[1] / 6.0)
-            else: s.tw.addData2((p[0] + p[1]) / 6.0, p[2] / 6.0)
+            s.vw.addData3(p[0], p[1], p[2]); s.nw.addData3(nx, ny, nz); s.gw.addData4(tx, ty, 0.0, 1.0)
+            # world-planar UVs (s.uv m tiles): floors use x/y, walls use along-wall/z
+            if abs(nz) > 0.5: s.tw.addData2(p[0] / s.uv, p[1] / s.uv)
+            else: s.tw.addData2((p[0] + p[1]) / s.uv, p[2] / s.uv)
             s.cw.addData4(col[0], col[1], col[2], col[3] if len(col) > 3 else 1.0)
         s.prim.addVertices(s.n, s.n + 1, s.n + 2)
         s.n += 3
@@ -209,7 +216,7 @@ def build_car(parent, col, helmet, num):
         if flap.isEmpty(): flap = root.attachNewNode("flap")
         tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
         tn.setTextColor(1, 1, 1, 1); tn.setShadow(0.06, 0.06); tn.setShadowColor(0, 0, 0, 1)
-        t = root.attachNewNode(tn); t.setBillboardPointEye(); t.setScale(2.2); t.setPos(0, 0, 3.0); t.setLightOff()
+        t = root.attachNewNode(tn); t.setBillboardPointEye(); t.setScale(2.2); t.setPos(0, 0, 3.0); t.setLightOff(); t.hide(NO_SHADOW)
         return root, flap
     c = (col[0], col[1], col[2], 1); c2 = (col[0] * .6, col[1] * .6, col[2] * .6, 1)
     dk = (0.07, 0.07, 0.08, 1)
@@ -237,8 +244,67 @@ def build_car(parent, col, helmet, num):
     tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
     tn.setTextColor(1, 1, 1, 1); tn.setShadow(0.06, 0.06); tn.setShadowColor(0, 0, 0, 1)
     t = root.attachNewNode(tn); t.setBillboardPointEye(); t.setScale(2.2)
-    t.setPos(0, 0, 3.0); t.setLightOff()
+    t.setPos(0, 0, 3.0); t.setLightOff(); t.hide(NO_SHADOW)
     return root, flap
+
+
+def soft_tex(rgb, peak, power=2.0, name="soft"):
+    """64x64 radial-falloff RGBA sprite: blob shadows, smoke puffs, sparks."""
+    n = 64; img = PNMImage(n, n, 4)
+    for y in range(n):
+        for x in range(n):
+            r = math.hypot((x + 0.5) / n * 2 - 1, (y + 0.5) / n * 2 - 1)
+            img.setXel(x, y, rgb[0], rgb[1], rgb[2]); img.setAlpha(x, y, peak * max(0.0, 1.0 - r) ** power)
+    tex = Texture(name); tex.load(img)
+    tex.setWrapU(SamplerState.WM_clamp); tex.setWrapV(SamplerState.WM_clamp)
+    return tex
+
+
+def vignette_tex():
+    n = 128; img = PNMImage(n, n, 4)
+    for y in range(n):
+        for x in range(n):
+            r = math.hypot((x + 0.5) / n * 2 - 1, (y + 0.5) / n * 2 - 1)
+            img.setXel(x, y, 0, 0, 0); img.setAlpha(x, y, 0.5 * clamp((r - 0.6) / 0.8, 0, 1) ** 1.6)
+    tex = Texture("vig"); tex.load(img)
+    tex.setWrapU(SamplerState.WM_clamp); tex.setWrapV(SamplerState.WM_clamp)
+    return tex
+
+
+class Particles:
+    """Pooled billboard sprites (tyre smoke, grass dust, collision sparks)."""
+    def __init__(s, parent, tex, n=360):
+        s.root = parent.attachNewNode("fx")
+        s.root.setLightOff(); s.root.setShaderOff(); s.root.setDepthWrite(False)
+        s.root.setTransparency(TransparencyAttrib.MAlpha); s.root.setTexture(tex)
+        cm = CardMaker("p"); cm.setFrame(-0.5, 0.5, -0.5, 0.5)
+        s.free, s.live = [], []
+        for _ in range(n):
+            p = s.root.attachNewNode(cm.generate()); p.setBillboardPointEye(); p.hide(); s.free.append(p)
+
+    def emit(s, pos, vel, life, s0, s1, col, a0=0.5, drag=1.2, grav=0.0):
+        if not s.free: return
+        p = s.free.pop(); p.setPos(pos); p.show()
+        s.live.append([p, Vec3(vel), life, 0.0, s0, s1, col, a0, drag, grav])
+
+    def update(s, dt):
+        keep = []
+        for q in s.live:
+            p, v, life, age, s0, s1, col, a0, drag, grav = q
+            age += dt
+            if age >= life: p.hide(); s.free.append(p); continue
+            q[3] = age
+            v *= max(0.0, 1.0 - drag * dt); v.z += grav * dt
+            p.setPos(p.getPos() + v * dt)
+            f = age / life
+            p.setScale(s0 + (s1 - s0) * f)
+            p.setColorScale(col[0], col[1], col[2], a0 * (1 - f) ** 1.2)
+            keep.append(q)
+        s.live = keep
+
+    def clear(s):
+        for q in s.live: q[0].hide(); s.free.append(q[0])
+        s.live = []
 
 
 # ------------------------------------------------------------------ track
@@ -360,6 +426,11 @@ class Car:
         helmet = (random.random(), random.random(), random.random(), 1)
         s.vis, s.flap = build_car(g.render, s.col, helmet, s.num)
         s.vis.setPos(x, y, 0.0); s.vis.setH(math.degrees(tr.th[idx]) - 90)
+        cm = CardMaker("blob"); cm.setFrame(-1.9, 1.9, -3.5, 3.5)       # soft contact shadow under the car
+        blob = s.vis.attachNewNode(cm.generate()); blob.setP(-90); blob.setZ(0.075)
+        blob.setTexture(g.blob_tex); blob.setTransparency(TransparencyAttrib.MAlpha)
+        blob.setLightOff(); blob.setShaderOff(); blob.setDepthWrite(False)
+        s.vl = 0.0
         s.pace = random.uniform(0.955, 1.0); s.aggr = random.uniform(0.1, CFG['aggr'])
         s.err = random.uniform(0.2, 1.0); s.line_off = random.uniform(-1.2, 1.2)
         s.pit_lap = random.choice([2, 3]); s.pit_state = None; s.pitted = False
@@ -399,7 +470,7 @@ class Car:
         vel = node.getLinearVelocity()
         q = s.np.getQuat(g.render); fwd = q.getForward(); right = q.getRight()
         vf = vel.dot(fwd); vl = vel.dot(right); spd = vel.length()
-        s.vf, s.spd = vf, spd
+        s.vf, s.spd, s.vl = vf, spd, vl
         if hold:
             node.setLinearVelocity(Vec3(0, 0, 0)); node.setAngularVelocity(Vec3(0, 0, 0))
             s.thr, s.brk = 0.0, 1.0
@@ -589,14 +660,14 @@ class Game(ShowBase):
         except Exception: s.mono = None
         s.track = Track()
         s.world = BulletWorld(); s.world.setGravity(Vec3(0, 0, 0))
-        s.setup_lights(); s.build_scene(); s.build_sky()
+        s.setup_lights(); s.setup_fx(); s.build_scene(); s.build_sky()
         s.cars, s.dots = [], []
         s.laps_opt, s.laps_i = [3, 4, 6, 8, 10], 2
         s.levels, s.lvl_i = list(LEVELS.keys()), 0
         s.state, s.first_run, s.pmenu = "menu", True, False
         s.buttons, s.menu_a, s.pin_cam, s.pin_pt = [], 0.0, None, None
         s.setup_ui(); s.setup_map(); s.setup_panels(); s.setup_menu(); s.setup_input()
-        s.spawn_cars(); s.show_state()
+        s.spawn_cars(); s.show_state(); s.setup_post()
         s.taskMgr.add(s.update, "update")
 
     def spawn_cars(s):
@@ -607,6 +678,7 @@ class Game(ShowBase):
         s.cars = [Car(s, i, d, i) for i, d in enumerate(drv)]
         s.order = s.cars[:]
         s.t, s.grid_t, s.paused, s.pmenu = 0.0, 7.0, False, False
+        s.fx.clear()
         s.replay, s.panel = None, False
         s.sel_inc = s.sel_car = s.sel_pen = 0
         s.score = s.reports = s.good = 0
@@ -1040,7 +1112,7 @@ class Game(ShowBase):
         dt = min(globalClock.getDt(), 1 / 30.0)
         if s.state != "menu":
             if s.replay: s.step_replay(dt)
-            elif not (s.paused or s.pmenu): s.step_sim(dt)
+            elif not (s.paused or s.pmenu): s.step_sim(dt); s.fx.update(dt)
         s.update_camera(dt); s.update_hover()
         if s.state != "menu": s.update_ui(dt)
         return task.cont
@@ -1050,7 +1122,7 @@ class Game(ShowBase):
         if s.state == "menu":
             s.menu_a += dt * 0.07; a = s.menu_a
             cam.setPos(-45 + 260 * math.cos(a), -10 + 260 * math.sin(a), 70 + 20 * math.sin(a * 2.3))
-            cam.lookAt(-45, -10, 4); s.camLens.setFov(62); s.sky.setPos(cam.getPos())
+            cam.lookAt(-45, -10, 4); s.camLens.setFov(62); s.sky.setPos(cam.getPos()); s.set_film(240)
             s.sun_np.setPos(35, -70, 150); s.sun_np.lookAt(-45, -10, 0)
             return
         car = s.cars[s.follow]
@@ -1080,6 +1152,16 @@ class Game(ShowBase):
                 cam.lookAt(s.pin_pt[0], s.pin_pt[1], s.pin_pt[2]); fov = 50
         else:
             cam.setPos(pos + fwd * 0.4 + Vec3(0, 0, 1.15)); cam.setHpr(car.vis.getH(s.render), -1.5, 0); fov = 88
+        # speed sensation: FOV widens with speed; chase/onboard get vibration (stronger on kerbs and grass)
+        sp = clamp(car.spd / 95.0, 0, 1)
+        if m in (1, 4) and s.state != "grid":
+            fov += (7 if m == 1 else 5) * sp
+            s.shake_t += dt
+            rough = 3.0 if abs(car.d) > HALF_W - 0.5 else 1.0
+            amp = (0.22 if m == 1 else 0.45) * sp * rough
+            cam.setR(cam.getR() + amp * math.sin(s.shake_t * 37.0))
+            cam.setP(cam.getP() + amp * 0.7 * math.sin(s.shake_t * 53.3 + 1.0))
+        s.set_film(240 if m == 2 else 100 if m == 4 else 150)
         s.camLens.setFov(fov)
         s.sky.setPos(cam.getPos())
         s.sun_np.setPos(pos + Vec3(80, -60, 150)); s.sun_np.lookAt(pos[0], pos[1], pos[2])
@@ -1155,43 +1237,113 @@ class Game(ShowBase):
         s.render.setLight(s.render.attachNewNode(amb))
         sun = DirectionalLight("sun"); sun.setColor((1.0, 0.95, 0.85, 1))
         sun.setShadowCaster(True, 4096 if QUALITY == "high" else 2048, 4096 if QUALITY == "high" else 2048)
-        ln = sun.getLens(); ln.setFilmSize(240, 240); ln.setNearFar(20, 520)
+        # tight depth range: simplepbr's shadow bias is in normalised depth
+        ln = s.sun_lens = sun.getLens(); ln.setFilmSize(240, 240); ln.setNearFar(100, 270); s._film = 240
+        sun.setCameraMask(BitMask32.bit(5))
         s.sun_np = s.render.attachNewNode(sun)
         s.sun_np.setPos(100, -80, 200); s.sun_np.lookAt(0, 0, 0)
         s.render.setLight(s.sun_np)
         if simplepbr is not None and QUALITY == "high":
             s.pbr = simplepbr.init(msaa_samples=4, max_lights=2, use_normal_maps=False,
-                                   enable_shadows=True, exposure=1.0)
+                                   enable_shadows=True, shadow_bias=0.0008, exposure=1.0)
         else:
             s.render.setShaderAuto()
         fog = Fog("fog"); fog.setColor(0.55, 0.72, 0.93); fog.setExpDensity(0.0007)
         s.render.setFog(fog)
 
+    def set_film(s, v):
+        """Sun shadow-frustum size (m): tight around the action = sharper shadows from the same 4k map."""
+        if abs(v - s._film) > 0.5: s._film = v; s.sun_lens.setFilmSize(v, v)
+
+    def setup_fx(s):
+        s.blob_tex = soft_tex((0, 0, 0), 0.55, 1.0, "blob")
+        s.fx = Particles(s.render, soft_tex((1, 1, 1), 1.0, 1.6, "puff"))
+        s.shake_t = 0.0
+
+    def setup_post(s):
+        """Vignette always; HDR bloom (high quality only), chained onto simplepbr's offscreen buffer so its
+        4x MSAA and tonemapping are kept. (SSAO is not possible here: simplepbr's shaders write no normals.)"""
+        cm = CardMaker("vig"); cm.setFrame(-1, 1, -1, 1)
+        s.vig = s.render2d.attachNewNode(cm.generate()); s.vig.setTexture(vignette_tex())
+        s.vig.setTransparency(TransparencyAttrib.MAlpha); s.vig.setBin("background", -1)
+        s.filters = None
+        if QUALITY != "high": return
+        try:
+            from direct.filter.CommonFilters import CommonFilters
+            pbr = getattr(s, "pbr", None)
+            target = pbr._filtermgr.buffers[0] if pbr is not None else s.win
+            f = CommonFilters(target, s.cam)
+            f.setHighDynamicRange(); f.setMSAA(4)
+            f.setBloom(blend=(0.3, 0.4, 0.3, 0.0), mintrigger=0.7, maxtrigger=1.2, desat=0.6,
+                       intensity=0.7, size="medium")
+            s.filters = f
+        except Exception as e:
+            print("post-processing skipped:", e)
+
+    def emit_fx(s, dt):
+        """Tyre smoke when sliding or locking, dust when on the grass."""
+        tr = s.track
+        for c in s.cars:
+            if c.spd < 8: continue
+            grass = tr.is_grass(c.d, tr.rel(c.idx))
+            kinds = ((c.spd * 1.2 if grass else 0.0, (0.55, 0.45, 0.30), 0.45, 2.2),
+                     (70.0 if abs(c.vl) > 3.0 else 0.0, (0.9, 0.9, 0.9), 0.5, 3.0),
+                     (14.0 if (c.brk > 0.92 and c.spd > 55) else 0.0, (0.85, 0.85, 0.85), 0.35, 2.4))
+            q = c.np.getQuat(s.render); f, r = q.getForward(), q.getRight(); p = c.np.getPos()
+            for rate, col, a0, sz in kinds:
+                if rate and random.random() < rate * dt:
+                    pos = p - f * 1.5 + r * random.choice((-0.95, 0.95)) + Vec3(0, 0, 0.25)
+                    vel = c.v * 0.15 + Vec3(random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(0.5, 1.8))
+                    s.fx.emit(pos, vel, random.uniform(1.2, 2.2), sz * 0.5, sz * 2.2, col, a0, 1.2, 0.3)
+
+    def sparks(s, pos, rel):
+        for _ in range(int(min(40, 8 + rel * 2))):
+            v = Vec3(random.uniform(-7, 7), random.uniform(-7, 7), random.uniform(1, 6))
+            s.fx.emit(pos + Vec3(0, 0, 0.3), v, random.uniform(0.3, 0.8), 0.35, 0.1, (1.0, 0.8, 0.3), 1.0, 0.8, -12.0)
+        for _ in range(4):
+            s.fx.emit(pos + Vec3(0, 0, 0.4), Vec3(random.uniform(-2, 2), random.uniform(-2, 2), 1.0),
+                      1.6, 1.5, 5.0, (0.8, 0.8, 0.8), 0.5, 1.5, 0.2)
+
     def build_scene(s):
-        tr = s.track; N = tr.N; ds = tr.ds; m = Mesh()
+        tr = s.track; N = tr.N; ds = tr.ds
+        # one mesh per material, each with its own texture and tile size (m)
+        m = Mesh(6.0); mg = Mesh(5.0); ma = Mesh(3.0); mv = Mesh(2.5); mp = Mesh(2.0)
         up = (0, 0, 1)
-        m.quad((-3000, -3000, -0.12), (3000, -3000, -0.12), (3000, 3000, -0.12), (-3000, 3000, -0.12),
-               (0.20, 0.47, 0.20, 1), up)
+        mg.quad((-3000, -3000, -0.12), (3000, -3000, -0.12), (3000, 3000, -0.12), (-3000, 3000, -0.12),
+                (0.20, 0.47, 0.20, 1), up)
         def edge(i, d, z): return (tr.x[i % N] + tr.nx[i % N] * d, tr.y[i % N] + tr.ny[i % N] * d, z)
-        def strip(i, j, d0, d1, z, col): m.quad(edge(i, d0, z), edge(j, d0, z), edge(j, d1, z), edge(i, d1, z), col, up)
-        def across(i, d0, d1, thick, col, z=0.05): strip(i, i + max(1, int(thick / ds)), d0, d1, z, col)
+        def strip(i, j, d0, d1, z, col, mm=None):
+            (mm or m).quad(edge(i, d0, z), edge(j, d0, z), edge(j, d1, z), edge(i, d1, z), col, up)
+        def across(i, d0, d1, thick, col, z=0.05, mm=None): strip(i, i + max(1, int(thick / ds)), d0, d1, z, col, mm or mp)
+        rnd = random.Random(11)
+        patch = [rnd.random() for _ in range(N // 12 + 2)]
         for i in range(N):
             j = i + 1
-            sh = 0.145 if (i // 6) % 2 == 0 else 0.160
-            strip(i, j, HALF_W, HALF_W + 16, -0.06, (0.62, 0.57, 0.42, 1))
-            strip(i, j, -HALF_W - 16, -HALF_W, -0.06, (0.62, 0.57, 0.42, 1))
-            strip(i, j, -HALF_W, HALF_W, 0.0, (sh, sh, sh + 0.01, 1))
-            strip(i, j, HALF_W - 0.35, HALF_W, 0.04, (1, 1, 1, 1))
-            strip(i, j, -HALF_W, -HALF_W + 0.35, 0.04, (1, 1, 1, 1))
+            sh = 0.135 + 0.028 * patch[i // 12]                       # tarmac patchwork, ~30 m sections
+            gravel = (0.62, 0.57, 0.42, 1)
+            strip(i, j, HALF_W, HALF_W + 16, -0.06, gravel, mv); strip(i, j, -HALF_W - 16, -HALF_W, -0.06, gravel, mv)
+            band = (0.20, 0.47, 0.20, 1) if (i // 8) % 2 == 0 else (0.24, 0.54, 0.22, 1)   # mown stripes
+            strip(i, j, HALF_W + 16, HALF_W + 70, -0.08, band, mg); strip(i, j, -HALF_W - 70, -HALF_W - 16, -0.08, band, mg)
+            strip(i, j, -HALF_W, HALF_W, 0.0, (sh, sh, sh + 0.01, 1), ma)
+            # rubbered-in racing line: hugs the inside of corners, graded edges
+            c = clamp(tr.k[i % N] * 250.0, -3.5, 3.5)
+            for d0, d1, f in ((-1.9, -0.9, 0.88), (-0.9, 0.9, 0.74), (0.9, 1.9, 0.88)):
+                strip(i, j, c + d0, c + d1, 0.01, (sh * f, sh * f, (sh + 0.01) * f, 1), ma)
+            strip(i, j, HALF_W - 0.35, HALF_W, 0.04, (1, 1, 1, 1), mp)
+            strip(i, j, -HALF_W, -HALF_W + 0.35, 0.04, (1, 1, 1, 1), mp)
             if abs(tr.k[i]) > 0.003:
                 kc = (0.85, 0.1, 0.1, 1) if (i // 2) % 2 == 0 else (0.95, 0.95, 0.95, 1)
-                strip(i, j, HALF_W, HALF_W + 1.3, 0.06, kc); strip(i, j, -HALF_W - 1.3, -HALF_W, 0.06, kc)
+                strip(i, j, HALF_W, HALF_W + 1.3, 0.06, kc, mp); strip(i, j, -HALF_W - 1.3, -HALF_W, 0.06, kc, mp)
+        for _ in range(45):                                            # repair patches across the track
+            i = rnd.randrange(N); w0 = rnd.uniform(-HALF_W, 0.0); w1 = min(HALF_W, w0 + rnd.uniform(3, 12))
+            v = rnd.choice((0.122, 0.168))
+            strip(i, i + rnd.randint(1, 4), w0, w1, 0.02, (v, v, v + 0.01, 1), ma)
         # start/finish chequers
         cols = 20; cw = 2 * HALF_W / cols
         for row in range(2):
             for c in range(cols):
                 col = (1, 1, 1, 1) if (c + row) % 2 else (0.05, 0.05, 0.05, 1)
-                strip(tr.i0 + row, tr.i0 + row + 1, -HALF_W + c * cw, -HALF_W + (c + 1) * cw, 0.05, col)
+                strip(tr.i0 + row, tr.i0 + row + 1, -HALF_W + c * cw, -HALF_W + (c + 1) * cw, 0.05, col, mp)
         # DRS detection (orange) and activation (green) lines
         for det, a0, a1 in tr.drs:
             across(det, -HALF_W, HALF_W, 1.0, (1.0, 0.55, 0.0, 1)); across(a0, -HALF_W, HALF_W, 1.0, (0.1, 0.9, 0.2, 1))
@@ -1202,11 +1354,11 @@ class Game(ShowBase):
             w0, w1 = pitw(o * ds), pitw((o + 1) * ds)
             if w0 < 0.02 or w1 < 0.02: continue
             i = tr.i0 + o; c0, c1, h0, h1 = PIT_C * w0, PIT_C * w1, 5 * w0, 5 * w1
-            m.quad(edge(i, c0 - h0, 0.03), edge(i + 1, c1 - h1, 0.03), edge(i + 1, c1 + h1, 0.03),
-                   edge(i, c0 + h0, 0.03), (0.30, 0.30, 0.36, 1), up)
+            ma.quad(edge(i, c0 - h0, 0.03), edge(i + 1, c1 - h1, 0.03), edge(i + 1, c1 + h1, 0.03),
+                    edge(i, c0 + h0, 0.03), (0.30, 0.30, 0.36, 1), up)
             if abs(o * ds) <= PIT_ZONE:
-                strip(i, i + 1, c0 - 5, c0 - 4.75, 0.05, (1, 0.85, 0.1, 1))
-                strip(i, i + 1, c0 + 4.75, c0 + 5, 0.05, (1, 0.85, 0.1, 1))
+                strip(i, i + 1, c0 - 5, c0 - 4.75, 0.05, (1, 0.85, 0.1, 1), mp)
+                strip(i, i + 1, c0 + 4.75, c0 + 5, 0.05, (1, 0.85, 0.1, 1), mp)
         for sg in (-PIT_ZONE, PIT_ZONE):
             across(tr.idx_at(sg), -19.5, -9.5, 1.5, (1, 0.85, 0.1, 1))
         for o in range(int(-185 / ds), int(185 / ds), 8):
@@ -1238,22 +1390,35 @@ class Game(ShowBase):
             m.frustum((x, y), 2.2, 11, 3.4, 0.1, (0.08, gch * 0.6, 0.1, 1), 8)
             placed += 1
         random.seed()
-        w = m.build(s.render, "world")
-        w.setTexture(s.make_grain(0.82, 0.34, 0.45, 3))
+        s.make_textures()
+        for mesh, name in ((m, "structures"), (mg, "grass"), (ma, "asphalt"), (mv, "gravel"), (mp, "paint")):
+            mesh.build(s.render, name).setTexture(s.tex[name])
 
-    def make_grain(s, base, var, blotch, seed):
-        """Mean-grey tileable noise texture, modulated with vertex colours (tarmac/grass/kerb grain)."""
-        rnd = random.Random(seed); n = 256
+    def make_textures(s):
+        s.tex = {
+            "structures": s.make_tex(0.82, 0.34, ((16, 0.45),), seed=3),
+            "asphalt": s.make_tex(0.78, 0.50, ((8, 0.28), (16, 0.22), (64, 0.16)), speck=0.03, seed=5),
+            "grass": s.make_tex(0.76, 0.60, ((4, 0.40), (8, 0.30), (32, 0.25)), tint=(0.93, 1.0, 0.85), seed=7),
+            "gravel": s.make_tex(0.72, 0.75, ((8, 0.30), (16, 0.30), (64, 0.30)), speck=0.08, seed=9),
+            "paint": s.make_tex(0.92, 0.20, ((8, 0.16),), speck=0.03, seed=13),
+        }
+
+    def make_tex(s, base, fine, octs, speck=0.0, tint=(1, 1, 1), seed=1, n=256):
+        """Mean-grey tileable multi-octave value noise (+ speckle), modulated with vertex colours."""
+        rnd = random.Random(seed)
+        lat = [(c, amp, [[rnd.random() for _ in range(c)] for _ in range(c)]) for c, amp in octs]
         img = PNMImage(n, n, 3)
-        low = [[rnd.random() for _ in range(16)] for _ in range(16)]
         for y in range(n):
             for x in range(n):
-                fx, fy = x / 16.0, y / 16.0; ix, iy = int(fx), int(fy); tx, ty = fx - ix, fy - iy
-                a, b = low[iy][ix], low[iy][(ix + 1) % 16]; c, d = low[(iy + 1) % 16][ix], low[(iy + 1) % 16][(ix + 1) % 16]
-                lo = (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
-                v = clamp(base + (rnd.random() - 0.5) * var + (lo - 0.5) * blotch, 0, 1)
-                img.setXel(x, y, v, v, v)
-        tex = Texture("grain"); tex.load(img)
+                v = base + (rnd.random() - 0.5) * fine
+                for c, amp, L in lat:
+                    fx, fy = x * c / n, y * c / n; ix, iy = int(fx), int(fy); tx, ty = fx - ix, fy - iy
+                    ix2, iy2 = (ix + 1) % c, (iy + 1) % c
+                    lo = (L[iy][ix] * (1 - tx) + L[iy][ix2] * tx) * (1 - ty) + (L[iy2][ix] * (1 - tx) + L[iy2][ix2] * tx) * ty
+                    v += (lo - 0.5) * amp
+                if speck and rnd.random() < speck: v += rnd.choice((-0.30, 0.25))
+                v = clamp(v, 0, 1); img.setXel(x, y, v * tint[0], v * tint[1], v * tint[2])
+        tex = Texture("tex"); tex.load(img)
         tex.setWrapU(SamplerState.WM_repeat); tex.setWrapV(SamplerState.WM_repeat)
         tex.setMinfilter(SamplerState.FT_linear_mipmap_linear); tex.setAnisotropicDegree(8)
         return tex
@@ -1323,6 +1488,7 @@ class Game(ShowBase):
         tr = s.track
         rel = (a.pv - b.pv).length()
         if rel < 2.0: return
+        s.sparks((a.np.getPos() + b.np.getPos()) * 0.5, rel)
         dp = wrap(b.prog - a.prog, tr.L); dd = b.d - a.d
         sg = 1 if dd >= 0 else -1
         na, nb = (tr.nx[a.idx], tr.ny[a.idx]), (tr.nx[b.idx], tr.ny[b.idx])
@@ -1404,7 +1570,7 @@ class Game(ShowBase):
         for c in s.cars: c.post(dt)
         s.order = sorted(s.cars, key=lambda c: (0, c.finish_time) if c.finished else (1, -c.prog))
         if s.state != "race": return
-        s.check_contacts()
+        s.check_contacts(); s.emit_fx(dt)
         for c in s.cars: c.monitor(dt)
         for inc in s.incidents:
             if inc.status == "open" and s.t - inc.t > 150:
