@@ -213,6 +213,19 @@ def build_car(parent, col, helmet, num):
         model.setPos(-(mn.x + mx.x) / 2, -(mn.y + mx.y) / 2 + 0.1, -mn.z)
         model.reparentTo(root)
         tint_car(model, col)
+        # the wheel parts are loose nodes: group each corner's tyre/rim/hub under a pivot on the axle (axle = X axis)
+        groups = {}
+        for n in model.findAllMatches("**/+GeomNode"):
+            a, b = n.getTightBounds(model); c, e = (a + b) / 2, b - a
+            if abs(c.x) > 0.5 and e.y > 0.3 and e.z > 0.3: groups.setdefault((c.x > 0, c.y > 0), []).append(n)
+        wheels = []
+        for parts in groups.values():
+            tyre = max(parts, key=lambda n: (n.getTightBounds(model)[1] - n.getTightBounds(model)[0]).z)
+            a, b = tyre.getTightBounds(model)
+            pv = model.attachNewNode("wheel"); pv.setPos((a + b) / 2)
+            for n in parts: n.wrtReparentTo(pv)
+            wheels.append((pv, (b.z - a.z) / 2 * 0.95, 1))          # (pivot, rolling radius in m, spin sign): glTF nose is -Y, procedural is +Y
+        root.setPythonTag("wheels", wheels)
         flap = model.find("**/flap")
         if flap.isEmpty(): flap = root.attachNewNode("flap")
         tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
@@ -238,14 +251,20 @@ def build_car(parent, col, helmet, num):
     m.build(root)
     flap = root.attachNewNode("flap"); flap.setPos(0, -1.85, 1.05)
     fm = Mesh(); fm.box((0, -0.15, 0.0), (0.95, 0.32, 0.04), c); fm.build(flap)
+    wheels = []
     for x, y, r, w in ((-0.9, 1.55, 0.34, 0.38), (0.9, 1.55, 0.34, 0.38),
                        (-0.9, -1.4, 0.38, 0.50), (0.9, -1.4, 0.38, 0.50)):
         wm = Mesh(); wm.frustum((0, 0), -w / 2, w / 2, r, r, (0.04, 0.04, 0.04, 1), 12)
-        wn = wm.build(root); wn.setR(90); wn.setPos(x, y, r)
+        wm.box((0, 0, w / 2), (r * 1.7, 0.07, 0.03), (0.75, 0.75, 0.78, 1))      # hub bar so the spin is visible
+        wm.box((0, 0, -w / 2), (r * 1.7, 0.07, 0.03), (0.75, 0.75, 0.78, 1))
+        pv = root.attachNewNode("wheel"); pv.setPos(x, y, r)
+        wn = wm.build(pv); wn.setR(90)
+        wheels.append((pv, r, -1))                                  # procedural nose is +Y
     tn = TextNode("num"); tn.setText(str(num)); tn.setAlign(TextNode.ACenter)
     tn.setTextColor(1, 1, 1, 1); tn.setShadow(0.06, 0.06); tn.setShadowColor(0, 0, 0, 1)
     t = root.attachNewNode(tn); t.setBillboardPointEye(); t.setScale(2.2)
     t.setPos(0, 0, 3.0); t.setLightOff(); t.hide(NO_SHADOW)
+    root.setPythonTag("wheels", wheels)
     return root, flap
 
 
@@ -273,7 +292,9 @@ def vignette_tex():
 
 
 SR = 22050
-SFX_VERSION = "3"                  # bump to regenerate the cached sfx/ folder
+SFX_VERSION = "4"                  # bump to regenerate the cached sfx/ folder
+V10_START, V10_LEN = "13.5", "1.4"  # steady ~1340 Hz slice of v10_scream.mp3 (seconds)
+V10_BASE_RPM = 10900.0              # engine_v10.wav plays "at" this game rpm at rate 1.0 (so 12000 rpm = 1.1x)
 GEAR_T = [0, 60, 95, 135, 175, 215, 255, 290, 345]
 ENGINE_BASE_RPM = 9000.0            # engine.wav is recorded "at" this rpm; play-rate = rpm / this
 
@@ -350,6 +371,20 @@ def make_sounds(d):
             v += amp * math.sin(TAU * 150 * h * t + ph[h])
         eng.append(math.tanh(1.4 * v * (1 + 0.18 * math.sin(TAU * 9 * t)) + 0.25 * nz[i]))
     save("engine.wav", eng, 0.8)
+    # real V10 recording (v10_scream.mp3): loop a steady high-rpm slice; the game varies play-rate with rpm
+    try:
+        import subprocess
+        src = os.path.join(HERE, "v10_scream.mp3")
+        if os.path.exists(src):
+            raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", V10_START, "-t", V10_LEN, "-i", src, "-ac", "1",
+                                  "-ar", str(SR), "-f", "s16le", "-"], capture_output=True, check=True).stdout
+            a = array.array("h"); a.frombytes(raw)
+            buf = [x / 32768.0 for x in a]
+            xf = int(0.2 * SR); Lp = len(buf) - xf
+            loop = [buf[i] * (i / xf) + buf[Lp + i] * (1 - i / xf) if i < xf else buf[i] for i in range(Lp)]
+            save("engine_v10.wav", loop, 0.85)
+    except Exception as e:
+        print("v10 sample skipped (needs ffmpeg):", e)
     # exhaust crackle on lift-off: a burst of overrun pops (two variants)
     for v_ in (1, 2):
         L = int(0.55 * SR); buf = [0.0] * L; t0 = 0.0
@@ -552,6 +587,7 @@ class Car:
         g.world.attachRigidBody(s.node)
         helmet = (random.random(), random.random(), random.random(), 1)
         s.vis, s.flap = build_car(g.render, s.col, helmet, s.num)
+        s.wheels = s.vis.getPythonTag("wheels"); s.wheel_a = 0.0
         s.vis.setPos(x, y, 0.0); s.vis.setH(math.degrees(tr.th[idx]) - 90)
         cm = CardMaker("blob"); cm.setFrame(-1.9, 1.9, -3.5, 3.5)       # soft contact shadow under the car
         blob = s.vis.attachNewNode(cm.generate()); blob.setP(-90); blob.setZ(0.075)
@@ -811,6 +847,9 @@ class Game(ShowBase):
             if cur != SFX_VERSION:                      # (re)generate whenever the synthesis changes
                 make_sounds(s.sfx_dir)
                 with open(stamp, "w") as fh: fh.write(SFX_VERSION)
+            s.engine_name = ("engine_pulse" if os.environ.get("FIA_ENGINE") == "pulse" else
+                             "engine_v10" if os.path.exists(os.path.join(s.sfx_dir, "engine_v10.wav")) else "engine")
+            s.engine_base = V10_BASE_RPM if s.engine_name == "engine_v10" else ENGINE_BASE_RPM
             s.audio3d = Audio3DManager(s.sfxManagerList[0], s.camera)
             s.audio3d.setDropOffFactor(1.0); s.audio3d.setDopplerFactor(0.7)
             s.crowd = s.loadsnd("crowd"); s.crowd.setLoop(True); s.crowd.setVolume(0); s.crowd.play()
@@ -830,7 +869,7 @@ class Game(ShowBase):
         if not s.audio_ok: return
         for c in s.cars:
             pair = []
-            for name in ("engine_pulse" if os.environ.get("FIA_ENGINE") == "pulse" else "engine", "squeal"):
+            for name in (s.engine_name, "squeal"):
                 snd = s.audio3d.loadSfx(os.path.join(s.sfx_dir, name + ".wav"))     # must be a positional sound
                 snd.setLoop(True); snd.setVolume(0)
                 s.audio3d.attachSoundToObject(snd, c.vis); s.audio3d.setSoundMinDistance(snd, 12.0)
@@ -864,7 +903,7 @@ class Game(ShowBase):
             kph = c.spd * 3.6; rpm = gear_rpm(kph)[1]
             if s.state == "grid" and s.grid_t < 2.5: rpm += 5000 * (2.5 - s.grid_t) / 2.5      # revving on the grid
             if c.finished or c.pit_state == "stopped": rpm = min(rpm, 5500)
-            eng.setPlayRate(clamp(rpm / ENGINE_BASE_RPM, 0.4, 1.6))
+            eng.setPlayRate(clamp(rpm / s.engine_base, 0.4, 1.6))
             eng.setVolume(0.35 + 0.35 * c.thr)
             slip = 0.0
             if c.spd > 15:
@@ -1409,6 +1448,9 @@ class Game(ShowBase):
             op = c.drs_open if not s.replay else getattr(c, "drs_open_vis", False)
             c.flap_a += ((-32.0 if op else 0.0) - c.flap_a) * min(1, 12 * dt)
             c.flap.setP(c.flap_a)
+            if not (s.paused or s.pmenu or s.replay) and c.wheels:        # wheels roll at the car's forward speed
+                c.wheel_a = (c.wheel_a + math.degrees(c.vf * dt / c.wheels[0][1])) % 360.0
+                for pv, _, sg in c.wheels: pv.setP(sg * c.wheel_a)
         for c, d in zip(s.cars, s.dots):
             x, z = s.map_xy(c.vis.getX(), c.vis.getY()); d.setPos(x, 0, z)
         fc = s.cars[s.follow]; x, z = s.map_xy(fc.vis.getX(), fc.vis.getY()); s.ring.setPos(x, 0, z)
