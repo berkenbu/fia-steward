@@ -1233,9 +1233,9 @@ class Game(ShowBase):
 
     # ---- carried over from v1 (incident logic, physics loop, replay)
     def setup_lights(s):
-        amb = AmbientLight("a"); amb.setColor((0.50, 0.53, 0.60, 1))
+        amb = AmbientLight("a"); amb.setColor((0.38, 0.41, 0.49, 1))
         s.render.setLight(s.render.attachNewNode(amb))
-        sun = DirectionalLight("sun"); sun.setColor((1.0, 0.95, 0.85, 1))
+        sun = DirectionalLight("sun"); sun.setColor((1.15, 1.09, 0.98, 1))
         sun.setShadowCaster(True, 4096 if QUALITY == "high" else 2048, 4096 if QUALITY == "high" else 2048)
         # tight depth range: simplepbr's shadow bias is in normalised depth
         ln = s.sun_lens = sun.getLens(); ln.setFilmSize(240, 240); ln.setNearFar(100, 270); s._film = 240
@@ -1256,7 +1256,7 @@ class Game(ShowBase):
         if abs(v - s._film) > 0.5: s._film = v; s.sun_lens.setFilmSize(v, v)
 
     def setup_fx(s):
-        s.blob_tex = soft_tex((0, 0, 0), 0.55, 1.0, "blob")
+        s.blob_tex = soft_tex((0, 0, 0), 0.7, 1.0, "blob")
         s.fx = Particles(s.render, soft_tex((1, 1, 1), 1.0, 1.6, "puff"))
         s.shake_t = 0.0
 
@@ -1288,7 +1288,9 @@ class Game(ShowBase):
             grass = tr.is_grass(c.d, tr.rel(c.idx))
             kinds = ((c.spd * 1.2 if grass else 0.0, (0.55, 0.45, 0.30), 0.45, 2.2),
                      (70.0 if abs(c.vl) > 3.0 else 0.0, (0.9, 0.9, 0.9), 0.5, 3.0),
-                     (14.0 if (c.brk > 0.92 and c.spd > 55) else 0.0, (0.85, 0.85, 0.85), 0.35, 2.4))
+                     (14.0 if (c.brk > 0.92 and c.spd > 55) else 0.0, (0.85, 0.85, 0.85), 0.35, 2.4),
+                     # tyres working hard through corners: more smoke the higher the lateral G
+                     (22.0 * clamp((abs(c.glat) - 1.3) / 0.9, 0.0, 1.0) if c.spd > 25 else 0.0, (0.88, 0.88, 0.88), 0.32, 2.2))
             q = c.np.getQuat(s.render); f, r = q.getForward(), q.getRight(); p = c.np.getPos()
             for rate, col, a0, sz in kinds:
                 if rate and random.random() < rate * dt:
@@ -1368,27 +1370,90 @@ class Game(ShowBase):
             i = tr.idx_at(-150.0 + k * 33.0)
             m.box(edge(i, -27, 2.5), (26, 9, 5), (0.82, 0.82, 0.86, 1), tr.th[i])
             m.box(edge(i, -27, 5.2), (26.6, 9.6, 0.5), (col[0], col[1], col[2], 1), tr.th[i])
-        # grandstands (opposite the pits)
+        # grandstands (opposite the pits), with a crowd on every tier
         pal = [(0.75, 0.2, 0.2), (0.2, 0.3, 0.75), (0.85, 0.7, 0.2)]
+        crowd = [(0.9, 0.15, 0.15), (0.15, 0.3, 0.85), (0.95, 0.85, 0.2), (0.95, 0.95, 0.95), (0.15, 0.15, 0.18),
+                 (0.2, 0.65, 0.3), (0.9, 0.5, 0.1), (0.7, 0.3, 0.75)]
+        rc = random.Random(31)
         for b, sr in enumerate((-170, 0, 170)):
             i = tr.idx_at(sr); cc = pal[b]
             for st in range(4):
-                h = 2.2 + 2.2 * st
-                m.box(edge(i, 30 + st * 6, h / 2), (70, 6, h), (cc[0], cc[1], cc[2], 1), tr.th[i])
+                h = 2.2 + 2.2 * st; dd = 30 + st * 6
+                m.box(edge(i, dd, h / 2), (70, 6, h), (cc[0], cc[1], cc[2], 1), tr.th[i])
+                for row in (dd - 1.2, dd + 1.2):
+                    u = -33.0
+                    while u < 33.0:
+                        ex, ey, ez = edge(i, row, h + 0.45)
+                        k = rc.choice(crowd); v = rc.uniform(0.75, 1.0)
+                        m.box((ex + tr.tx[i] * u, ey + tr.ty[i] * u, ez), (0.5, 0.5, 0.9 * rc.uniform(0.9, 1.1)),
+                              (k[0] * v, k[1] * v, k[2] * v, 1), tr.th[i])
+                        u += rc.uniform(0.95, 1.3)
         # starting gantry
         for sg in (-1, 1): m.box(edge(tr.i0, sg * (HALF_W + 2), 4.5), (1, 1, 9), (0.15, 0.15, 0.18, 1), tr.th[tr.i0])
         m.box(edge(tr.i0, 0, 9.5), (1.2, 2 * HALF_W + 6, 1.4), (0.15, 0.15, 0.18, 1), tr.th[tr.i0])
-        # trees
+        # ---- trackside furniture: barriers + ad boards, tyre walls, catch fences, marshal posts, floodlights, paddock
+        ads = [(0.90, 0.12, 0.12, 1), (0.12, 0.32, 0.80, 1), (0.95, 0.80, 0.12, 1), (0.12, 0.60, 0.32, 1),
+               (0.93, 0.93, 0.95, 1), (0.10, 0.10, 0.13, 1), (0.92, 0.42, 0.10, 1)]
+        def pit_side(i, side): return side < 0 and abs(tr.rel(i % N)) < 215     # garages live on this side
+        step = 2; L = step * ds
+        for i in range(0, N, step):
+            ic = (i + step // 2) % N; k = tr.k[ic]; ang = tr.th[ic]
+            for side in (-1, 1):
+                if pit_side(ic, side): continue
+                m.box(edge(ic, side * (HALF_W + 17.5), 0.25), (L + 0.2, 0.4, 0.5), (0.72, 0.72, 0.75, 1), ang)   # armco
+                if abs(k) < 0.003:
+                    m.box(edge(ic, side * (HALF_W + 17.2), 1.05), (L - 0.4, 0.12, 1.0),
+                          ads[(i // (step * 2) + (side > 0)) % len(ads)], ang)                                   # ad board
+                    if (i // step) % 2 == 0:
+                        m.box(edge(i, side * (HALF_W + 17.9), 2.0), (0.14, 0.14, 4.0), (0.12, 0.12, 0.14, 1), ang)  # fence post
+                    m.box(edge(ic, side * (HALF_W + 17.9), 3.9), (L, 0.06, 0.06), (0.12, 0.12, 0.14, 1), ang)       # fence rail
+            if abs(k) > 0.0035:
+                out = -1 if k > 0 else 1                                             # outside of the corner
+                if pit_side(ic, out): continue
+                m.box(edge(ic, out * (HALF_W + 16.4), 0.6), (L + 0.1, 0.9, 1.2), (0.06, 0.06, 0.07, 1), ang)    # tyre wall
+                m.box(edge(ic, out * (HALF_W + 16.4), 1.25), (L - 0.1, 0.5, 0.12),
+                      (0.85, 0.1, 0.1, 1) if (i // step) % 2 else (0.95, 0.95, 0.95, 1), ang)
+        for n in range(1, max(tr.turn_of) + 1):                                      # marshal posts
+            ids = [i for i in range(N) if tr.turn_of[i] == n]; i = ids[len(ids) // 2]
+            out = -1 if tr.k[i] > 0 else 1
+            if pit_side(i, out): continue
+            m.box(edge(i, out * (HALF_W + 21), 1.4), (2.6, 2.6, 2.8), (0.95, 0.5, 0.08, 1), tr.th[i])
+            m.box(edge(i, out * (HALF_W + 21), 3.0), (3.4, 3.4, 0.25), (0.15, 0.15, 0.18, 1), tr.th[i])
+        for n, i in enumerate(range(5, N, 70)):                                       # floodlight towers
+            side = 1 if n % 2 else -1
+            m.box(edge(i, side * (HALF_W + 55), 8.0), (0.5, 0.5, 16.0), (0.35, 0.35, 0.38, 1), tr.th[i])
+            m.box(edge(i, side * (HALF_W + 55), 16.5), (5.0, 1.0, 1.2), (0.95, 0.93, 0.8, 1), tr.th[i])
+        i0 = tr.i0                                                                    # paddock buildings behind the garages
+        m.box(edge(i0, -46, 4.0), (330, 14, 8.0), (0.75, 0.77, 0.80, 1), tr.th[i0])
+        m.box(edge(i0, -46, 8.3), (332, 14.6, 0.6), (0.22, 0.24, 0.28, 1), tr.th[i0])
+        ct = tr.idx_at(60)                                                            # race-control tower
+        m.box(edge(ct, -56, 11.0), (12, 12, 22.0), (0.80, 0.80, 0.83, 1), tr.th[ct])
+        m.box(edge(ct, -56, 19.0), (12.4, 12.4, 3.2), (0.10, 0.22, 0.32, 1), tr.th[ct])
+        m.box(edge(ct, -56, 22.4), (13.5, 13.5, 0.6), (0.2, 0.2, 0.24, 1), tr.th[ct])
+        # trees: mixed pines and broadleaf, denser and further out
         random.seed(7)
-        xs, ys = [min(tr.x) - 250, max(tr.x) + 250], [min(tr.y) - 250, max(tr.y) + 250]
+        xs, ys = [min(tr.x) - 450, max(tr.x) + 450], [min(tr.y) - 450, max(tr.y) + 450]
         sub = list(range(0, N, 8)); placed = 0
-        while placed < 90:
+        while placed < 320:
             x, y = random.uniform(*xs), random.uniform(*ys)
-            if min((x - tr.x[i]) ** 2 + (y - tr.y[i]) ** 2 for i in sub) < 60 ** 2: continue
-            gch = random.uniform(0.35, 0.6)
-            m.frustum((x, y), 0, 3.2, 0.4, 0.3, (0.35, 0.22, 0.12, 1), 6)
-            m.frustum((x, y), 2.2, 11, 3.4, 0.1, (0.08, gch * 0.6, 0.1, 1), 8)
+            if min((x - tr.x[i]) ** 2 + (y - tr.y[i]) ** 2 for i in sub) < 55 ** 2: continue
+            sc = random.uniform(0.7, 1.5); gch = random.uniform(0.35, 0.6)
+            m.frustum((x, y), 0, 3.2 * sc, 0.4 * sc, 0.3 * sc, (0.35, 0.22, 0.12, 1), 6)
+            if random.random() < 0.35:                                        # broadleaf: rounded crown
+                col = (0.12 + random.uniform(0, 0.1), gch * 0.85, 0.1, 1)
+                m.frustum((x, y), 2.6 * sc, 6.6 * sc, 3.4 * sc, 3.0 * sc, col, 9)
+                m.frustum((x, y), 6.6 * sc, 9.0 * sc, 3.0 * sc, 0.4 * sc, col, 9)
+            else:                                                             # pine
+                m.frustum((x, y), 2.2 * sc, 11 * sc, 3.4 * sc, 0.1, (0.08, gch * 0.6, 0.1, 1), 8)
             placed += 1
+        # distant hills: huge low cones that dissolve into the haze
+        cx, cy = (min(tr.x) + max(tr.x)) / 2, (min(tr.y) + max(tr.y)) / 2
+        for k in range(26):
+            a = 2 * math.pi * (k + random.uniform(-0.3, 0.3)) / 26; r = random.uniform(1500, 2300)
+            hh = random.uniform(80, 230); base = random.uniform(380, 620)
+            g = random.uniform(0.32, 0.44)
+            m.frustum((cx + r * math.cos(a), cy + r * math.sin(a)), -5, hh, base, base * random.uniform(0.08, 0.2),
+                      (0.20, g, 0.24, 1), 12)
         random.seed()
         s.make_textures()
         for mesh, name in ((m, "structures"), (mg, "grass"), (ma, "asphalt"), (mv, "gravel"), (mp, "paint")):
