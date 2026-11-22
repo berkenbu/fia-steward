@@ -13,11 +13,12 @@ from collections import deque
 from panda3d.core import (loadPrcFileData, Vec3, Point3, Point2, TextNode, CardMaker, LineSegs,
     AmbientLight, DirectionalLight, Fog, TransparencyAttrib, GeomVertexFormat,
     GeomVertexData, GeomVertexWriter, Geom, GeomTriangles, GeomNode, AntialiasAttrib,
-    PNMImage, Texture, SamplerState, GeomVertexArrayFormat, NodePath, BitMask32)
+    PNMImage, Texture, SamplerState, GeomVertexArrayFormat, NodePath, BitMask32, AudioSound)
 loadPrcFileData("", "window-title FIA Steward Simulator\nwin-size 1600 900\n"
                     "sync-video 1\nmultisamples 4\nframebuffer-multisample 1\n")
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.OnscreenText import OnscreenText
+from direct.showbase.Audio3DManager import Audio3DManager
 from panda3d.bullet import BulletWorld, BulletRigidBodyNode, BulletBoxShape
 try:                                    # optional visual upgrades: pip install panda3d-simplepbr panda3d-gltf
     import simplepbr
@@ -271,6 +272,132 @@ def vignette_tex():
     return tex
 
 
+SR = 22050
+SFX_VERSION = "3"                  # bump to regenerate the cached sfx/ folder
+GEAR_T = [0, 60, 95, 135, 175, 215, 255, 290, 345]
+ENGINE_BASE_RPM = 9000.0            # engine.wav is recorded "at" this rpm; play-rate = rpm / this
+
+
+def gear_rpm(kph):
+    gear = 1
+    while gear < 8 and kph >= GEAR_T[gear]: gear += 1
+    fr = clamp((kph - GEAR_T[gear - 1]) / (GEAR_T[gear] - GEAR_T[gear - 1]), 0, 1)
+    return gear, (4500 if kph < 5 else int(6500 + 5500 * fr))
+
+
+def make_sounds(d):
+    """Synthesize every sound effect as a 16-bit mono WAV in folder d (no external assets needed)."""
+    import wave, array
+    os.makedirs(d, exist_ok=True)
+    rnd = random.Random(5)
+    TAU = 2 * math.pi
+
+    def save(name, buf, peak=0.9, sr=SR):
+        m = max(abs(x) for x in buf) or 1.0
+        a = array.array("h", [int(clamp(x / m * peak, -1, 1) * 32767) for x in buf])
+        w = wave.open(os.path.join(d, name), "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(a.tobytes()); w.close()
+
+    def noise(n): return [rnd.uniform(-1, 1) for _ in range(n)]
+
+    def lowpass(buf, a):
+        y, out = 0.0, []
+        for x in buf: y += a * (x - y); out.append(y)
+        return out
+
+    def loopify(buf, L):                                   # crossfade the tail into the head: seamless loop
+        f = len(buf) - L
+        return [buf[i] * (i / f) + buf[L + i] * (1 - i / f) if i < f else buf[i] for i in range(L)]
+
+    def bandpass(buf, f, q, sr):                           # resonant biquad: rings at f after each impulse
+        w = TAU * f / sr; al = math.sin(w) / (2 * q); a0 = 1 + al
+        b0, b2, a1, a2 = al / a0, -al / a0, -2 * math.cos(w) / a0, (1 - al) / a0
+        x1 = x2 = y1 = y2 = 0.0; out = []
+        for x in buf:
+            y = b0 * x + b2 * x2 - a1 * y1 - a2 * y2
+            x2, x1, y2, y1 = x1, x, y1, y; out.append(y)
+        return out
+
+    # engine (recorded "at" 9000 rpm): V6 hybrid. Six uneven exhaust pulses per 4-stroke cycle (450/s, pattern
+    # repeats 75x/s so the loop is seamless) ring through three exhaust resonances, plus intake roar,
+    # a harmonic scream and a turbo/MGU-H whine, all soft-clipped.
+    SE = 32000; L = SE; n = L + int(0.15 * SE)
+    amps = (1.0, 0.78, 0.95, 0.68, 0.90, 0.82); jit = (0.0, 0.25, -0.15, 0.3, -0.25, 0.1)
+    imp = [0.0] * n
+    for k in range(int(n / SE * 450) + 2):
+        i = int((k + jit[k % 6] * 0.3) / 450 * SE)
+        if 0 <= i < n: imp[i] += amps[k % 6]
+    bark = [a * 1.0 + b * 0.8 + c * 0.45 + e * 0.9 for a, b, c, e in
+            zip(bandpass(imp, 850, 2.2, SE), bandpass(imp, 2300, 3.0, SE), bandpass(imp, 5200, 4.0, SE),
+                bandpass(imp, 260, 1.4, SE))]
+    roar = bandpass(noise(n), 650, 1.1, SE)
+    eng = []
+    for i in range(n):
+        t = i / SE
+        scream = sum(math.sin(TAU * 450 * h * t) / h for h in (1, 2, 3, 4, 6, 8))
+        whine = 0.9 * math.sin(TAU * 3600 * t + 1.6 * math.sin(TAU * 7 * t)) + 0.35 * math.sin(TAU * 7200 * t)
+        v = 0.18 * bark[i] + 0.35 * roar[i] * (0.65 + 0.35 * math.cos(TAU * 450 * t)) + 0.45 * scream + 0.10 * whine
+        eng.append(math.tanh(1.6 * v * (1 + 0.10 * math.sin(TAU * 9 * t))))
+    save("engine_pulse.wav", loopify(eng, L), 0.8, SE)       # experimental; use with FIA_ENGINE=pulse
+    # original engine: harmonic stack on 150 Hz, soft-clipped, with a little roughness
+    L = SR; nz = lowpass(noise(L), 0.5)
+    ph = [rnd.random() * TAU for _ in range(24)]
+    eng = []
+    for i in range(L):
+        t = i / SR; v = 0.0
+        for h in range(1, 23):
+            amp = (1.0 / h ** 0.8) * (1.5 if h in (2, 4, 6) else 1.0)
+            v += amp * math.sin(TAU * 150 * h * t + ph[h])
+        eng.append(math.tanh(1.4 * v * (1 + 0.18 * math.sin(TAU * 9 * t)) + 0.25 * nz[i]))
+    save("engine.wav", eng, 0.8)
+    # exhaust crackle on lift-off: a burst of overrun pops (two variants)
+    for v_ in (1, 2):
+        L = int(0.55 * SR); buf = [0.0] * L; t0 = 0.0
+        for _ in range(rnd.randint(5, 8)):
+            t0 += rnd.uniform(0.02, 0.09); i0 = int(t0 * SR); a = rnd.uniform(0.4, 1.0)
+            for j in range(min(int(0.025 * SR), L - i0)):
+                if i0 + j < L: buf[i0 + j] += a * rnd.uniform(-1, 1) * math.exp(-j / (0.004 * SR))
+        buf = [x + y for x, y in zip(buf, bandpass(buf, 1400 + 500 * v_, 1.6, SR))]
+        save("pop%d.wav" % v_, buf, 0.8)
+    # wind rush at speed (volume is driven by the watched car's speed)
+    L = 2 * SR; n = noise(L + 4000)
+    wd = [a * 1.5 + b for a, b in zip(bandpass(n, 500, 0.7, SR), bandpass(n, 1800, 0.6, SR))]
+    save("wind.wav", loopify(wd, L), 0.6)
+    # tyre squeal: slip-stick tones with a hissy edge and a ~10 Hz chatter
+    L = int(1.5 * SR); n = noise(L + 3000); hp = [a - b for a, b in zip(n, lowpass(n, 0.25))]
+    sq = [(0.75 + 0.25 * math.sin(TAU * 10 * i / SR)) *
+          (0.5 * math.sin(TAU * 1800 * i / SR + 1.5 * math.sin(TAU * 4 * i / SR)) +
+           0.3 * math.sin(TAU * 2700 * i / SR + 0.8 * math.sin(TAU * 6 * i / SR)) +
+           0.15 * math.sin(TAU * 900 * i / SR)) + 0.55 * hp[i] for i in range(L + 3000)]
+    save("squeal.wav", loopify(sq, L), 0.7)
+    # crowd / track ambience: low rumble + soft wash with a slow swell
+    L = 3 * SR; n = noise(L + 6000); lo = lowpass(n, 0.05); mid = lowpass(n, 0.3)
+    cr = [(lo[i] * 2.0 + (mid[i] - lo[i]) * 0.8) * (1 + 0.25 * math.sin(TAU * i / L * 2)) for i in range(L + 6000)]
+    save("crowd.wav", loopify(cr, L), 0.6)
+    # crash: noise burst + thud + metallic ring
+    L = int(1.3 * SR); n = lowpass(noise(L), 0.35); cr = []
+    for i in range(L):
+        t = i / SR
+        ring = sum(math.sin(TAU * f * t) for f in (610, 970, 1530, 2310)) * 0.12 * math.exp(-t * 7)
+        cr.append(n[i] * math.exp(-t * 5) + 0.9 * math.sin(TAU * 55 * t) * math.exp(-t * 9) + ring)
+    for _ in range(14):                                    # debris: carbon-fibre tinkles falling after the hit
+        t0 = rnd.uniform(0.06, 0.95); i0 = int(t0 * SR); a = 0.35 * math.exp(-t0 * 2.5); fq = rnd.uniform(2200, 5200)
+        for j in range(min(int(0.05 * SR), L - i0)):
+            cr[i0 + j] += a * math.sin(TAU * fq * j / SR) * math.exp(-j / (0.008 * SR))
+    save("crash.wav", cr, 0.95)
+    # beep / lights out / radio blip / ruling ding
+    def tone(freqs, dur, decay=0.0, atk=0.005):
+        n = int(dur * SR)
+        return [sum(math.sin(TAU * f * i / SR) for f in freqs) * min(1, i / (atk * SR), (n - i) / (0.01 * SR)) *
+                math.exp(-decay * i / SR) for i in range(n)]
+    save("beep.wav", tone([1000], 0.2), 0.5)
+    save("go.wav", tone([1000, 1500], 0.6, 2.0), 0.6)
+    nz = noise(int(0.05 * SR))
+    save("radio.wav", tone([1450], 0.07) + [0.0] * int(0.03 * SR) + tone([1050], 0.09) +
+         [x * 0.3 for x in nz], 0.5)
+    save("ding.wav", tone([880, 1320], 0.7, 5.0), 0.6)
+
+
 class Particles:
     """Pooled billboard sprites (tyre smoke, grass dust, collision sparks)."""
     def __init__(s, parent, tex, n=360):
@@ -441,7 +568,7 @@ class Car:
         s.pass_t = 0.0; s.pass_dir = 1; s.mistake_t = 0.0; s.mistake_dir = 1; s.dive_t = -5.0
         s.idx = idx; s.pidx = idx; s.d = 0.0; s.prog = 0.0; s.s_last = 0.0
         s.v = Vec3(0, 0, 0); s.pv = Vec3(0, 0, 0); s.vf = 0.0; s.spd = 0.0
-        s.thr = 0.0; s.brk = 0.0; s.glat = 0.0; s.glon = 0.0
+        s.thr = 0.0; s.brk = 0.0; s.glat = 0.0; s.glon = 0.0; s.hi_t = -99.0
         s.laps_done = 0; s.started = False; s.lap_t0 = 0.0; s.last_lap = None; s.best_lap = None
         s.finished = False; s.finish_time = None
         s.loop_key = -1; s.times = {}
@@ -667,15 +794,93 @@ class Game(ShowBase):
         s.state, s.first_run, s.pmenu = "menu", True, False
         s.buttons, s.menu_a, s.pin_cam, s.pin_pt = [], 0.0, None, None
         s.setup_ui(); s.setup_map(); s.setup_panels(); s.setup_menu(); s.setup_input()
+        s.setup_audio()
         s.spawn_cars(); s.show_state(); s.setup_post()
         s.taskMgr.add(s.update, "update")
 
+    # =====================================================================
+    #  audio
+    # =====================================================================
+    def setup_audio(s):
+        s.audio_ok, s.muted, s.oneshots, s.car_snd, s.crowd_boost, s._lit = False, False, [], [], 0.0, 0
+        try:
+            s.sfx_dir = os.path.join(HERE, "sfx")
+            stamp = os.path.join(s.sfx_dir, "version.txt")
+            try: cur = open(stamp).read().strip()
+            except OSError: cur = ""
+            if cur != SFX_VERSION:                      # (re)generate whenever the synthesis changes
+                make_sounds(s.sfx_dir)
+                with open(stamp, "w") as fh: fh.write(SFX_VERSION)
+            s.audio3d = Audio3DManager(s.sfxManagerList[0], s.camera)
+            s.audio3d.setDropOffFactor(1.0); s.audio3d.setDopplerFactor(0.7)
+            s.crowd = s.loadsnd("crowd"); s.crowd.setLoop(True); s.crowd.setVolume(0); s.crowd.play()
+            s.wind = s.loadsnd("wind"); s.wind.setLoop(True); s.wind.setVolume(0); s.wind.play()
+            s.audio_ok = True
+        except Exception as e:
+            print("audio disabled:", e)
+
+    def loadsnd(s, name): return s.loader.loadSfx(os.path.join(s.sfx_dir, name + ".wav"))
+
+    def clear_car_sounds(s):
+        for pair in s.car_snd:
+            for snd in pair: s.audio3d.detachSound(snd); snd.stop()
+        s.car_snd = []
+
+    def make_car_sounds(s):
+        if not s.audio_ok: return
+        for c in s.cars:
+            pair = []
+            for name in ("engine_pulse" if os.environ.get("FIA_ENGINE") == "pulse" else "engine", "squeal"):
+                snd = s.audio3d.loadSfx(os.path.join(s.sfx_dir, name + ".wav"))     # must be a positional sound
+                snd.setLoop(True); snd.setVolume(0)
+                s.audio3d.attachSoundToObject(snd, c.vis); s.audio3d.setSoundMinDistance(snd, 12.0)
+                snd.play()
+                if name.startswith("engine"): snd.setTime(random.random() * 0.9)          # de-phase the engines
+                pair.append(snd)
+            s.car_snd.append(tuple(pair))
+
+    def play_fx(s, name, pos=None, vol=1.0):
+        """One-shot effect; with pos, quieter the further the camera is from it."""
+        if not s.audio_ok or s.muted: return
+        if pos is not None:
+            vol *= clamp(30.0 / max((Vec3(pos) - s.camera.getPos(s.render)).length(), 30.0), 0, 1)
+            if vol < 0.03: return
+        snd = s.loadsnd(name); snd.setVolume(min(1.0, vol)); snd.play()
+        s.oneshots = [x for x in s.oneshots if x.status() == AudioSound.PLAYING] + [snd]
+
+    def update_audio(s, dt):
+        if not s.audio_ok: return
+        s.crowd_boost = max(0.0, s.crowd_boost - dt)
+        live = s.state in ("grid", "race", "over") and not (s.paused or s.pmenu or s.replay) and not s.muted
+        s.crowd.setVolume(0.0 if s.muted else (0.10 if s.state == "menu" else 0.16 + (0.35 if s.crowd_boost > 0 else 0.0)))
+        fc = s.cars[s.follow]
+        s.wind.setVolume(0.5 * clamp(fc.spd / 95.0, 0, 1) ** 2 if live and s.cam_mode in (1, 4) else 0.0)
+        for c, (eng, sq) in zip(s.cars, s.car_snd):
+            if not live: eng.setVolume(0.0); sq.setVolume(0.0); continue
+            if c.thr > 0.9: c.hi_t = s.t                                        # overrun crackle on lift-off
+            elif c.thr < 0.05 and s.t - c.hi_t < 0.5 and c.spd > 45:
+                c.hi_t = -99.0
+                if random.random() < 0.3: s.play_fx(random.choice(("pop1", "pop2")), c.vis.getPos(), 1.0)
+            kph = c.spd * 3.6; rpm = gear_rpm(kph)[1]
+            if s.state == "grid" and s.grid_t < 2.5: rpm += 5000 * (2.5 - s.grid_t) / 2.5      # revving on the grid
+            if c.finished or c.pit_state == "stopped": rpm = min(rpm, 5500)
+            eng.setPlayRate(clamp(rpm / ENGINE_BASE_RPM, 0.4, 1.6))
+            eng.setVolume(0.35 + 0.35 * c.thr)
+            slip = 0.0
+            if c.spd > 15:
+                slip = max(clamp((abs(c.glat) - 1.5) / 1.2, 0, 1), clamp((abs(c.vl) - 2.0) / 6.0, 0, 1))
+            sq.setVolume(0.55 * slip); sq.setPlayRate(0.92 + 0.16 * slip)
+
+    def k_mute(s): s.muted = not s.muted
+
     def spawn_cars(s):
+        if s.audio_ok: s.clear_car_sounds()
         for c in s.cars:
             s.world.removeRigidBody(c.node); c.np.removeNode(); c.vis.removeNode()
         CFG.update(LEVELS[s.levels[s.lvl_i]]); set_laps(s.laps_opt[s.laps_i])
         drv = DRIVERS[:]; random.shuffle(drv)
         s.cars = [Car(s, i, d, i) for i, d in enumerate(drv)]
+        s.make_car_sounds(); s._lit = 0
         s.order = s.cars[:]
         s.t, s.grid_t, s.paused, s.pmenu = 0.0, 7.0, False, False
         s.fx.clear()
@@ -959,7 +1164,7 @@ class Game(ShowBase):
             "MOUSE   click a car, a timing-board row, or the track map to spectate. Click the map's track to\n"
             "        pin a trackside camera at that spot. All on-screen buttons are clickable.\n"
             "KEYS    R report form | V replay (0.5x) | I jump to latest incident | 1-5 cameras | TAB next car\n"
-            "        SPACE pause | ESC menu / close | H help\n\n"
+            "        SPACE pause | ESC menu / close | H help | M mute\n\n"
             "SCORE   Match the stewards' verdict for points. Wrong driver or too harsh a penalty loses points.\n\n"
             "                                        (click anywhere to close)"))
 
@@ -1058,7 +1263,7 @@ class Game(ShowBase):
     # =====================================================================
     def setup_input(s):
         for key, fn in (("r", s.k_report), ("v", s.k_replay), ("i", s.k_jump), ("tab", s.k_tab),
-                        ("space", s.k_pause), ("h", s.k_help), ("escape", s.k_esc), ("enter", s.k_enter),
+                        ("space", s.k_pause), ("h", s.k_help), ("m", s.k_mute), ("escape", s.k_esc), ("enter", s.k_enter),
                         ("mouse1", s.on_click),
                         ("arrow_up", lambda: s.k_nav(-1, 0)), ("arrow_down", lambda: s.k_nav(1, 0)),
                         ("arrow_left", lambda: s.k_nav(0, -1)), ("arrow_right", lambda: s.k_nav(0, 1))):
@@ -1113,7 +1318,7 @@ class Game(ShowBase):
         if s.state != "menu":
             if s.replay: s.step_replay(dt)
             elif not (s.paused or s.pmenu): s.step_sim(dt); s.fx.update(dt)
-        s.update_camera(dt); s.update_hover()
+        s.update_camera(dt); s.update_hover(); s.update_audio(dt)
         if s.state != "menu": s.update_ui(dt)
         return task.cont
 
@@ -1178,6 +1383,9 @@ class Game(ShowBase):
             row.setFg((1, 1, 1, 1) if c is s.cars[s.follow] else tuple(min(1, 0.45 + v * 0.65) for v in c.col) + (1,))
         lead = order[0]
         s.lap_txt.setText("LAP %d/%d     %s" % (min(LAPS, lead.laps_done + 1), LAPS, fmt_lap(s.t)))
+        lit = sum(1 for k in range(5) if s.grid_t < 6.5 - k) if s.state == "grid" else 0
+        if lit > s._lit and not s.paused: s.play_fx("beep", vol=0.5)
+        s._lit = lit
         for k, r in enumerate(s.lights):
             if s.state != "grid": r.hide()
             else:
@@ -1209,11 +1417,7 @@ class Game(ShowBase):
 
     def update_tel(s):
         c = s.cars[s.follow]; kph = c.spd * 3.6
-        gt = [0, 60, 95, 135, 175, 215, 255, 290, 345]
-        gear = 1
-        while gear < 8 and kph >= gt[gear]: gear += 1
-        fr = clamp((kph - gt[gear - 1]) / (gt[gear] - gt[gear - 1]), 0, 1)
-        rpm = 4500 if kph < 5 else int(6500 + 5500 * fr)
+        gear, rpm = gear_rpm(kph)
         s.tel_h.setText("TELEMETRY   #%d %s   P%d   %s" % (c.num, c.code, s.order.index(c) + 1, "PIT" if c.pit_state else ""))
         s.tel_spd.setText("%3d" % kph); s.tel_gear.setText(str(gear) if kph > 3 else "N")
         s.bar_t.setPos(-0.75, 0, 0.372); s.bar_t.setScale(max(0.001, 0.7 * c.thr), 1, 0.03)
@@ -1287,10 +1491,10 @@ class Game(ShowBase):
             if c.spd < 8: continue
             grass = tr.is_grass(c.d, tr.rel(c.idx))
             kinds = ((c.spd * 1.2 if grass else 0.0, (0.55, 0.45, 0.30), 0.45, 2.2),
-                     (70.0 if abs(c.vl) > 3.0 else 0.0, (0.9, 0.9, 0.9), 0.5, 3.0),
-                     (14.0 if (c.brk > 0.92 and c.spd > 55) else 0.0, (0.85, 0.85, 0.85), 0.35, 2.4),
+                     (48.0 if abs(c.vl) > 3.0 else 0.0, (0.9, 0.9, 0.9), 0.45, 3.0),
+                     (9.0 if (c.brk > 0.92 and c.spd > 55) else 0.0, (0.85, 0.85, 0.85), 0.30, 2.4),
                      # tyres working hard through corners: more smoke the higher the lateral G
-                     (22.0 * clamp((abs(c.glat) - 1.3) / 0.9, 0.0, 1.0) if c.spd > 25 else 0.0, (0.88, 0.88, 0.88), 0.32, 2.2))
+                     (13.0 * clamp((abs(c.glat) - 1.4) / 0.9, 0.0, 1.0) if c.spd > 25 else 0.0, (0.88, 0.88, 0.88), 0.28, 2.2))
             q = c.np.getQuat(s.render); f, r = q.getForward(), q.getRight(); p = c.np.getPos()
             for rate, col, a0, sz in kinds:
                 if rate and random.random() < rate * dt:
@@ -1547,13 +1751,15 @@ class Game(ShowBase):
         names = " / ".join("#%d %s" % (c.num, c.code) for c in cars)
         s.say("INCIDENT %d - LAP %d - %s - %s (%s) - NOTED" % (inc.n, lap, kind, names, loc), col)
         s.banner("INCIDENT NOTED: %s %s" % (kind, names), 3.0, col)
+        s.play_fx("radio", vol=0.6)
         s.refresh_report()
 
     def on_collision(s, a, b):
         tr = s.track
         rel = (a.pv - b.pv).length()
         if rel < 2.0: return
-        s.sparks((a.np.getPos() + b.np.getPos()) * 0.5, rel)
+        mid = (a.np.getPos() + b.np.getPos()) * 0.5
+        s.sparks(mid, rel); s.play_fx("crash", mid, min(1.0, 0.35 + rel / 12.0) * 2.0)
         dp = wrap(b.prog - a.prog, tr.L); dd = b.d - a.d
         sg = 1 if dd >= 0 else -1
         na, nb = (tr.nx[a.idx], tr.ny[a.idx]), (tr.nx[b.idx], tr.ny[b.idx])
@@ -1610,6 +1816,7 @@ class Game(ShowBase):
         elif car is not inc.fault: pts = -40 if pen == 0 else -100
         else: pts = -60 if pen == 0 else [100, 55, 15, -20, -40][min(abs(pen - corr), 4)]
         inc.status = "closed"; s.reports += 1; s.score += pts
+        s.play_fx("ding", vol=0.5)
         if pts >= 55: s.good += 1
         if pen == 1: car.warnings += 1
         car.pen_s += PENALTIES[pen][1]
@@ -1625,6 +1832,7 @@ class Game(ShowBase):
             s.grid_t -= dt
             if s.grid_t <= 0:
                 s.state = "race"; s.banner("LIGHTS OUT - AND AWAY WE GO!", 3, (0.4, 1, 0.4, 1))
+                s.play_fx("go", vol=0.5)
                 s.say("LIGHTS OUT - the race is on", (0.4, 1, 0.4, 1))
         else:
             s.t += dt
@@ -1672,7 +1880,7 @@ class Game(ShowBase):
 
     def on_finish(s, c):
         if s.first_fin is None:
-            s.first_fin = s.t; s.banner("CHEQUERED FLAG - #%d %s WINS" % (c.num, c.code), 5, (1, 1, 1, 1))
+            s.first_fin = s.t; s.crowd_boost = 8.0; s.banner("CHEQUERED FLAG - #%d %s WINS" % (c.num, c.code), 5, (1, 1, 1, 1))
             s.say("CHEQUERED FLAG - #%d %s takes the win" % (c.num, c.code), (1, 1, 1, 1))
 
     def step_replay(s, dt):
